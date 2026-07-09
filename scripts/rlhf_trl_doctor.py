@@ -1,0 +1,190 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import os
+import platform
+import subprocess
+import sys
+from importlib import metadata
+from pathlib import Path
+
+from _bootstrap import ensure_repo_root_on_path
+
+
+REQUIRED_PACKAGES = (
+    "torch",
+    "torchvision",
+    "torchaudio",
+    "torchao",
+    "trl",
+    "transformers",
+    "datasets",
+    "accelerate",
+    "peft",
+    "numpy",
+    "pandas",
+    "protobuf",
+)
+
+
+def _check_versions(errors: list[str]) -> None:
+    print(f"Python: {sys.version.split()[0]} ({sys.executable})")
+    print(f"Platform: {platform.platform()}")
+    for package in REQUIRED_PACKAGES:
+        try:
+            installed = metadata.version(package)
+        except metadata.PackageNotFoundError:
+            errors.append(f"{package} is not installed")
+            continue
+        print(f"{package}: {installed}")
+
+
+def _check_imports(errors: list[str]) -> None:
+    for module in (
+        "torch",
+        "transformers",
+        "datasets",
+        "accelerate",
+        "peft",
+        "trl",
+    ):
+        try:
+            __import__(module)
+        except Exception as exc:
+            errors.append(f"import {module} failed: {type(exc).__name__}: {exc}")
+
+
+def _check_trl_apis(errors: list[str]) -> None:
+    try:
+        from trl import RewardConfig, RewardTrainer, SFTConfig, SFTTrainer
+        from trl.experimental.ppo import PPOConfig, PPOTrainer
+    except Exception as exc:
+        errors.append(f"TRL trainer API check failed: {type(exc).__name__}: {exc}")
+        return
+    names = [SFTConfig, SFTTrainer, RewardConfig, RewardTrainer, PPOConfig, PPOTrainer]
+    print("TRL trainer APIs:", ", ".join(item.__name__ for item in names))
+
+
+def _check_cuda(errors: list[str], require_cuda: bool) -> None:
+    try:
+        import torch
+    except Exception:
+        return
+    print(f"CUDA available: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+        print(f"BF16 supported: {torch.cuda.is_bf16_supported()}")
+    elif require_cuda:
+        errors.append("CUDA is unavailable; select a GPU runtime in Colab")
+
+
+def _check_directory(path: Path, label: str, errors: list[str]) -> None:
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        probe = path / ".rlhf_write_probe"
+        probe.write_text("ok\n", encoding="utf-8")
+        probe.unlink()
+        print(f"{label}: writable ({path})")
+    except Exception as exc:
+        errors.append(f"{label} is not writable ({path}): {type(exc).__name__}: {exc}")
+
+
+def _check_data(cfg, stage: str, errors: list[str]) -> None:
+    cache_dir = Path(str(cfg.data.cache_dir))
+    for split_key in ("train_split", "eval_split"):
+        split = str(cfg.data.get(split_key, "train" if split_key == "train_split" else "validation"))
+        path = cache_dir / stage / split
+        if path.exists():
+            print(f"{stage} {split}: found ({path})")
+        else:
+            errors.append(
+                f"prepared {stage} dataset is missing at {path}; "
+                "rerun scripts/rlhf_trl_prepare_data.py with the same data.cache_dir"
+            )
+
+
+def _tokenizer_source(cfg, stage: str) -> str:
+    if stage == "sft":
+        return str(cfg.model.name)
+    if stage == "reward":
+        return str(cfg.model.sft_model_path)
+    return str(cfg.model.policy_model_path)
+
+
+def _check_tokenizer(cfg, stage: str, errors: list[str]) -> None:
+    try:
+        from rlhf.trl_common import load_tokenizer
+
+        source = _tokenizer_source(cfg, stage)
+        tokenizer = load_tokenizer(
+            source,
+            trust_remote_code=bool(cfg.model.get("trust_remote_code", False)),
+            padding_side="left" if stage == "ppo" else "right",
+        )
+        print(f"Tokenizer source: {source}")
+        print(f"EOS token/id: {tokenizer.eos_token!r} / {tokenizer.eos_token_id}")
+        print(f"PAD token/id: {tokenizer.pad_token!r} / {tokenizer.pad_token_id}")
+        if tokenizer.eos_token_id is None:
+            errors.append("Tokenizer has no EOS token; PPO stop_token=eos would be ill-defined.")
+        if tokenizer.pad_token_id is None:
+            errors.append("Tokenizer has no PAD token after setup.")
+        if tokenizer.eos_token_id is not None and tokenizer.pad_token_id == tokenizer.eos_token_id:
+            errors.append("Tokenizer PAD and EOS token IDs must be distinct.")
+        if "qwen" in source.lower() and tokenizer.eos_token != "<|im_end|>":
+            print(
+                "Warning: Qwen chat models usually use '<|im_end|>' as EOS; "
+                "verify this tokenizer before the full run."
+            )
+    except Exception as exc:
+        errors.append(f"tokenizer check failed: {type(exc).__name__}: {exc}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Validate a TRL/Colab runtime before starting an RLHF stage.")
+    parser.add_argument("--config", required=True)
+    parser.add_argument("--stage", choices=("sft", "reward", "ppo"), required=True)
+    parser.add_argument("--set", action="append", default=[], metavar="KEY=VALUE")
+    parser.add_argument("--allow-cpu", action="store_true")
+    args = parser.parse_args()
+
+    ensure_repo_root_on_path()
+    from rlhf.trl_common import load_config_with_overrides
+
+    cfg = load_config_with_overrides(args.config, args.set)
+    errors: list[str] = []
+    _check_versions(errors)
+    _check_imports(errors)
+    _check_trl_apis(errors)
+    _check_cuda(errors, require_cuda=not args.allow_cpu)
+    _check_tokenizer(cfg, args.stage, errors)
+    _check_data(cfg, args.stage, errors)
+    _check_directory(Path(str(cfg.train.output_dir)), "local output", errors)
+    for key, label in (
+        ("checkpoint_sync_dir", "checkpoint sync"),
+        ("final_sync_dir", "final sync"),
+    ):
+        value = cfg.train.get(key)
+        if value:
+            _check_directory(Path(os.path.expanduser(str(value))), label, errors)
+
+    try:
+        commit = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+        print(f"Git commit: {commit}")
+    except Exception:
+        pass
+
+    if errors:
+        print("\nTRL preflight failed:", file=sys.stderr)
+        for error in errors:
+            print(f"- {error}", file=sys.stderr)
+        raise SystemExit(1)
+    print("\nTRL preflight passed.")
+
+
+if __name__ == "__main__":
+    main()
